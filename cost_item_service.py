@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from .db import write_audit
 from .models import CostItem
+from .text_utils import normalize_text
 
 
 FIELD_MAP = {
@@ -156,35 +157,93 @@ def find_cost_item_reference(
     item_name: str,
     unit: str = "",
     category: str = "",
+    *,
+    min_score: float = 0.45,
+    contains_limit: int = 200,
+    candidate_limit: int = 1500,
 ) -> tuple[CostItem | None, float]:
-    """优先精确/包含匹配，最后在候选集中做中文模糊匹配。"""
+    """优先精确/包含匹配，最后在候选集中做中文模糊匹配。
+
+    返回 (CostItem or None, score_float)，score 范围 0.0-1.0。
+    """
     keyword = _text(item_name)
     if not keyword:
         return None, 0.0
+    keyword_norm = normalize_text(keyword)
+    unit = _text(unit)
+    unit_norm = normalize_text(unit) if unit else ""
+
     query = session.query(CostItem)
     if category:
         query = query.filter(CostItem.full_category.contains(category))
+
+    # 1) 精确匹配（库中原始文本相等）
     exact = query.filter(CostItem.item_name == keyword).order_by(CostItem.id).first()
-    if exact and (not unit or exact.unit == unit):
-        return exact, 1.0
-    contains = query.filter(
+    if exact:
+        if not unit or exact.unit == unit:
+            return exact, 1.0
+        # unit 不匹配：仍然返回，但降低置信度（便于人工复核）
+        return exact, 0.9
+
+    # 2) 包含匹配（先用 DB 限定候选，然后在 Python 侧用规范化+快速相似度排序）
+    contains_q = query.filter(
         or_(CostItem.item_name.contains(keyword), CostItem.features.contains(keyword))
-    ).limit(100).all()
-    if unit:
-        same_unit = [item for item in contains if item.unit == unit]
-        if same_unit:
-            contains = same_unit
+    ).limit(int(contains_limit))
+    contains = contains_q.all()
     if contains:
-        best = max(contains, key=lambda item: fuzz.WRatio(keyword, item.item_name))
-        return best, fuzz.WRatio(keyword, best.item_name) / 100
-    candidates = query.order_by(CostItem.id).limit(1500).all()
+        # 若指定 unit，优先筛选 unit 相同的候选
+        if unit:
+            same_unit = [item for item in contains if item.unit == unit]
+            if same_unit:
+                contains = same_unit
+        best = None
+        best_score = -1.0
+        for item in contains:
+            score = fuzz.WRatio(keyword_norm, normalize_text(item.item_name))
+            if score > best_score:
+                best_score = score
+                best = item
+        if best is not None:
+            final_score = float(best_score) / 100.0
+            return best, final_score
+
+    # 3) 全库近似匹配（受 candidate_limit 限制）
+    candidates = query.order_by(CostItem.id).limit(int(candidate_limit)).all()
+    if not candidates:
+        return None, 0.0
+
+    # 若指定 unit，则把同单位候选放前面（提高命中概率）
     if unit:
-        candidates = [item for item in candidates if item.unit == unit] or candidates
-    match = process.extractOne(keyword, {item.id: item.item_name for item in candidates}, scorer=fuzz.WRatio)
+        same_unit = [c for c in candidates if c.unit == unit]
+        if same_unit:
+            prioritized = same_unit + [c for c in candidates if c.unit != unit]
+            candidates = prioritized
+
+    # 构建 id->normalized name 映射供 rapidfuzz 使用
+    choices = {candidate.id: normalize_text(candidate.item_name) for candidate in candidates}
+    try:
+        match = process.extractOne(keyword_norm, choices, scorer=fuzz.WRatio)
+    except Exception:
+        match = None
+
     if not match:
         return None, 0.0
-    _, score, item_id = match
-    if score < 45:
-        return None, score / 100
-    item = next((candidate for candidate in candidates if candidate.id == item_id), None)
-    return item, score / 100
+
+    # process.extractOne 返回 (best_value, score, key) when choices is dict
+    try:
+        _, score, matched_key = match
+    except Exception:
+        # 兼容不同 rapidfuzz 版本的返回结构
+        if isinstance(match, tuple) and len(match) >= 2:
+            score = match[1]
+            matched_key = match[-1]
+        else:
+            return None, 0.0
+
+    matched_score = float(score) / 100.0
+    # 如果分数太低则视为未命中（但仍把分数返回用于诊断）
+    if matched_score < float(min_score):
+        return None, matched_score
+
+    matched_item = next((c for c in candidates if c.id == matched_key), None)
+    return matched_item, matched_score
