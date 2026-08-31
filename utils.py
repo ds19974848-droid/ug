@@ -8,6 +8,7 @@ from .db import get_session, write_audit
 from .models import Material, MaterialPrice, MaterialAlias, Region
 from .models import Project, ProjectItem, OfficialSource, SubscriptionTask, PriceHistory
 from .material_service import build_material_identity_cache, find_or_create_material, infer_price_basis
+from .text_utils import normalize_text
 
 
 def export_prices_to_excel(session: Session, filepath: str, region_id: int = None):
@@ -68,11 +69,17 @@ def import_prices_from_excel(filepath: str, session: Session) -> dict:
     if not headers:
         workbook.close()
         return {"success": False, "imported": 0, "error": "Excel 没有数据"}
-    header_index = {str(value).strip(): index for index, value in enumerate(headers) if value is not None}
-    mapping = {
-        key: next((header_index[label] for label in labels if label in header_index), None)
-        for key, labels in aliases.items()
-    }
+    # make header lookup robust by normalizing
+    header_index = {normalize_text(str(value)).strip(): index for index, value in enumerate(headers) if value is not None}
+    mapping = {}
+    for key, labels in aliases.items():
+        found = None
+        for label in labels:
+            idx = header_index.get(normalize_text(label))
+            if idx is not None:
+                found = idx
+                break
+        mapping[key] = found
     missing = [key for key in ("name", "region", "period", "price") if mapping[key] is None]
     if missing:
         workbook.close()
@@ -160,79 +167,3 @@ def import_prices_from_excel(filepath: str, session: Session) -> dict:
     write_audit(session, "import", "material_price", detail=f"Excel导入: {imported}条")
     session.commit()
     return {"success": True, "imported": imported, "skipped": skipped, "errors": errors}
-
-
-def export_project_to_excel(project_id: int, filepath: str) -> bool:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill
-    from openpyxl.utils import get_column_letter
-    session = get_session()
-    try:
-        project = session.query(Project).filter(Project.id == project_id).first()
-        if not project:
-            return False
-        items = session.query(ProjectItem).filter(
-            ProjectItem.project_id == project_id
-        ).order_by(ProjectItem.seq_no).all()
-        wb = Workbook()
-        ws = wb.active
-        ws.title = project.name[:31]
-        headers = [
-            "序号", "清单编号", "清单名称", "规格", "单位", "工程量",
-            "人工费单价", "材料费单价", "机械费单价", "未拆分直接费单价",
-            "管理费单价", "利润单价", "综合单价", "合价", "备注",
-        ]
-        header_fill = PatternFill(start_color="2563EB", end_color="2563EB", fill_type="solid")
-        header_font = Font(color="FFFFFF", bold=True)
-        ws.append(headers)
-        for col_idx in range(1, len(headers) + 1):
-            cell = ws.cell(row=1, column=col_idx)
-            cell.fill = header_fill
-            cell.font = header_font
-        for item in items:
-            ws.append([
-                item.seq_no, item.item_code, item.item_name, item.spec, item.unit, item.quantity,
-                item.labor_unit_price, item.material_unit_price, item.machinery_unit_price,
-                item.unallocated_unit_price, item.management_unit_price, item.profit_unit_price,
-                item.unit_price, item.total_price, item.notes,
-            ])
-        ws.append([])
-        ws.append(["总造价", project.total_amount])
-        for col_idx in range(1, len(headers) + 1):
-            ws.column_dimensions[get_column_letter(col_idx)].width = 16
-        wb.save(filepath)
-        write_audit(session, "export", "project", project_id, detail=f"导出报价: {project.name}")
-        session.commit()
-        return True
-    except Exception:
-        session.rollback()
-        return False
-    finally:
-        session.close()
-
-
-def is_official_domain(url: str) -> bool:
-    from urllib.parse import urlparse
-
-    host = (urlparse(url).hostname or "").lower().rstrip(".")
-    trusted_official_hosts = {
-        "202.61.90.35",
-        "sceci.net",
-        "www.sceci.net",
-    }
-    return host in trusted_official_hosts or host == "gov.cn" or host.endswith(".gov.cn")
-
-
-def detect_anomaly(price: float, previous_price: Optional[float] = None) -> tuple:
-    from .config import config
-    reasons = []
-    if price < config.PRICE_MIN_SANE:
-        reasons.append(f"价格过低 ({price} < {config.PRICE_MIN_SANE})")
-    if price > config.PRICE_MAX_SANE:
-        reasons.append(f"价格过高 ({price} > {config.PRICE_MAX_SANE})")
-    if previous_price and previous_price > 0:
-        change = abs(price - previous_price) / previous_price
-        if change > config.PRICE_CHANGE_THRESHOLD:
-            direction = "涨" if price > previous_price else "跌"
-            reasons.append(f"价格{direction}幅异常 ({change:.1%} > {config.PRICE_CHANGE_THRESHOLD:.0%})")
-    return (len(reasons) > 0, "; ".join(reasons))
