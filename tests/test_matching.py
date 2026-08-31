@@ -2,8 +2,8 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from src.models import Base, CostItem
-from src.cost_item_service import find_cost_item_reference
+from models import Base, CostItem
+from cost_item_service import find_cost_item_reference
 
 
 @pytest.fixture()
@@ -35,7 +35,8 @@ def test_find_cost_item_unit_mismatch(db_session):
     found, score = find_cost_item_reference(db_session, '测试项 B', unit='m2')
     assert found is not None
     assert found.item_name == '测试项 B'
-    assert 0.7 <= score <= 0.95
+    # our matching returns ~0.9 for exact name but unit mismatch; allow small tolerance
+    assert 0.85 <= score <= 0.95
 
 
 def test_find_cost_item_fuzzy(db_session):
